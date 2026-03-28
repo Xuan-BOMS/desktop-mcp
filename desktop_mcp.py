@@ -7,788 +7,785 @@ import sys
 import time
 import winreg
 from io import BytesIO
-from pathlib import Path
 from typing import Any, Optional
 
 import pyautogui
-from litellm import completion
 
 try:
-    import tomllib
-except Exception:  # pragma: no cover
-    tomllib = None
-
+    from litellm import completion
+except Exception:
+    completion = None
 
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.12
+pyautogui.PAUSE = 0.06
 
 
-def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
-    raw = _read_user_env(name)
-    if not raw:
-        return default
+def _env(name: str) -> str:
+    v = os.environ.get(name, "").strip()
+    if v:
+        return v
     try:
-        value = int(raw)
-    except Exception:
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def _read_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
-    raw = _read_user_env(name)
-    if not raw:
-        return default
-    try:
-        value = float(raw)
-    except Exception:
-        return default
-    return max(minimum, min(maximum, value))
-
-
-def _read_user_env(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if value:
-        return value
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment")
-        raw, _ = winreg.QueryValueEx(key, name)
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment")
+        raw, _ = winreg.QueryValueEx(k, name)
         return str(raw).strip()
     except OSError:
         return ""
 
 
-def _first_non_empty(*values: str) -> str:
-    for value in values:
-        text = str(value or "").strip()
-        if text:
-            return text
-    return ""
+def _pick(*names: str, default: str = "") -> str:
+    for n in names:
+        v = _env(n)
+        if v:
+            return v
+    return default
 
 
-def _codex_home() -> Path:
-    raw = os.environ.get("CODEX_HOME", "").strip()
-    if raw:
-        return Path(raw).expanduser()
-    return Path.home() / ".codex"
-
-
-def _read_codex_auth_key() -> str:
-    auth_path = _codex_home() / "auth.json"
-    if not auth_path.exists():
-        return ""
+def _to_int(v: Any, d: int) -> int:
     try:
-        data = json.loads(auth_path.read_text(encoding="utf-8"))
+        return int(v)
     except Exception:
-        return ""
-    value = data.get("OPENAI_API_KEY", "")
-    return str(value).strip()
+        return d
 
 
-def _read_codex_provider_defaults() -> dict[str, str]:
-    if tomllib is None:
-        return {}
-    home = _codex_home()
-    candidates = [home / "config.toml", home / "config_88.toml"]
-    for path in candidates:
-        if not path.exists():
-            continue
-        try:
-            cfg = tomllib.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        model = str(cfg.get("model", "")).strip()
-        provider = str(cfg.get("model_provider", "")).strip()
-        base_url = ""
-        providers = cfg.get("model_providers")
-        if provider and isinstance(providers, dict):
-            provider_cfg = providers.get(provider)
-            if isinstance(provider_cfg, dict):
-                base_url = str(provider_cfg.get("base_url", "")).strip()
-        if not base_url:
-            base_url = str(cfg.get("base_url", "")).strip()
-        if model or base_url:
-            return {"model": model, "api_base": base_url}
-    return {}
+def _to_float(v: Any, d: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return d
 
 
-MODEL_TIMEOUT_SEC = _read_float_env("DESKTOP_MCP_MODEL_TIMEOUT_SEC", 16.0, 5.0, 90.0)
-MODEL_RETRIES = _read_int_env("DESKTOP_MCP_MODEL_RETRIES", 1, 0, 6)
-MODEL_MAX_IMAGE_SIDE = _read_int_env("DESKTOP_MCP_IMAGE_MAX_SIDE", 1400, 640, 2560)
-MODEL_IMAGE_QUALITY = _read_int_env("DESKTOP_MCP_IMAGE_QUALITY", 70, 30, 95)
-GOAL_DEADLINE_SEC = _read_float_env("DESKTOP_MCP_GOAL_DEADLINE_SEC", 105.0, 20.0, 240.0)
+def _to_bool(v: Any, d: bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return d
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return d
 
 
-def load_client() -> dict[str, str]:
-    codex_cfg = _read_codex_provider_defaults()
-    api_key = _first_non_empty(
-        _read_user_env("OI_THIRD_PARTY_API_KEY"),
-        _read_user_env("OPENAI_API_KEY"),
-        _read_codex_auth_key(),
-        "EMPTY",
-    )
-    api_base = _first_non_empty(
-        _read_user_env("OI_THIRD_PARTY_API_BASE"),
-        _read_user_env("OPENAI_BASE_URL"),
-        _read_user_env("OPENAI_API_BASE"),
-        codex_cfg.get("api_base", ""),
-    )
-    model = _first_non_empty(
-        _read_user_env("OI_THIRD_PARTY_MODEL"),
-        _read_user_env("OPENAI_MODEL"),
-        codex_cfg.get("model", ""),
-        "gpt-5.3-codex",
-    )
-    if "/" not in model:
+def _client() -> dict[str, str]:
+    if completion is None:
+        raise RuntimeError("litellm not installed")
+    api_key = _pick("OI_THIRD_PARTY_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY")
+    api_base = _pick("OI_THIRD_PARTY_API_BASE", "OPENAI_BASE_URL", "OPENAI_API_BASE", "LITELLM_BASE_URL")
+    model = _pick("OI_THIRD_PARTY_MODEL", "OPENAI_MODEL", "LITELLM_MODEL", default="openai/gpt-5.3-codex")
+    if "/" not in model and not model.startswith("azure/"):
         model = f"openai/{model}"
-    if not api_base:
-        raise RuntimeError(
-            "Missing API base URL. Set OI_THIRD_PARTY_API_BASE or OPENAI_BASE_URL/OPENAI_API_BASE, "
-            "or provide ~/.codex/config.toml with model provider base_url."
-        )
+    if not api_key or not api_base:
+        raise RuntimeError("Missing gateway env. Set OI_THIRD_PARTY_* or OPENAI_*.")
     return {"api_key": api_key, "api_base": api_base, "model": model}
 
 
-def _capture_screenshot() -> tuple[Any, tuple[int, int], bytes]:
+def _screen() -> tuple[int, int]:
+    s = pyautogui.size()
+    return int(s.width), int(s.height)
+
+
+def _xy(x: int, y: int) -> tuple[int, int]:
+    w, h = _screen()
+    return max(0, min(w - 1, int(x))), max(0, min(h - 1, int(y)))
+
+
+def _button(v: Any) -> str:
+    s = str(v or "left").strip().lower()
+    m = {"l": "left", "r": "right", "m": "middle", "left": "left", "right": "right", "middle": "middle"}
+    if s not in m:
+        raise ValueError(f"unsupported button: {v}")
+    return m[s]
+
+
+def _key(v: Any) -> str:
+    s = str(v or "").strip().lower()
+    if not s:
+        raise ValueError("key required")
+    return {
+        "control": "ctrl",
+        "ctl": "ctrl",
+        "windows": "win",
+        "command": "win",
+        "cmd": "win",
+        "return": "enter",
+        "del": "delete",
+        "pgup": "pageup",
+        "pgdn": "pagedown",
+    }.get(s, s)
+
+
+def _keys(v: Any) -> list[str]:
+    if isinstance(v, list):
+        raw = [str(x).strip() for x in v if str(x).strip()]
+    else:
+        raw = [x.strip() for x in re.split(r"[+,\s]+", str(v or "")) if x.strip()]
+    out = [_key(x) for x in raw]
+    if not out:
+        raise ValueError("keys required")
+    return out
+
+
+def _region(v: Any) -> Optional[tuple[int, int, int, int]]:
+    if not v:
+        return None
+    if isinstance(v, dict):
+        x, y, w, h = _to_int(v.get("x"), 0), _to_int(v.get("y"), 0), _to_int(v.get("width"), 0), _to_int(v.get("height"), 0)
+    elif isinstance(v, list) and len(v) == 4:
+        x, y, w, h = [_to_int(i, 0) for i in v]
+    else:
+        raise ValueError("region must be {x,y,width,height} or [x,y,width,height]")
+    sw, sh = _screen()
+    x = max(0, min(sw - 1, x))
+    y = max(0, min(sh - 1, y))
+    w = max(1, min(sw - x, w))
+    h = max(1, min(sh - y, h))
+    return x, y, w, h
+
+
+def _encode(img: Any, fmt: str = "png", quality: int = 82) -> tuple[bytes, str, str]:
+    f = str(fmt or "png").lower()
+    if f in {"jpg", "jpeg"}:
+        f = "jpeg"
+    elif f != "png":
+        raise ValueError("format must be png|jpeg")
+    if getattr(img, "mode", "") not in {"RGB", "L"}:
+        img = img.convert("RGB")
+    q = max(30, min(95, int(quality)))
+    b = BytesIO()
+    if f == "jpeg":
+        img.save(b, format="JPEG", quality=q, optimize=True)
+        return b.getvalue(), "image/jpeg", f
+    img.save(b, format="PNG", optimize=True)
+    return b.getvalue(), "image/png", f
+
+
+def capture(include_base64: bool = True, save: str = "", fmt: str = "png", quality: int = 82, region: Any = None) -> dict[str, Any]:
+    rg = _region(region)
+    img = pyautogui.screenshot(region=rg) if rg else pyautogui.screenshot()
+    raw, mime, fn = _encode(img, fmt=fmt, quality=quality)
+    w, h = img.size
+    sw, sh = _screen()
+    out: dict[str, Any] = {"ok": True, "format": fn, "mime": mime, "width": int(w), "height": int(h), "screen_size": {"width": sw, "height": sh}}
+    if rg:
+        out["region"] = {"x": rg[0], "y": rg[1], "width": rg[2], "height": rg[3]}
+    if include_base64:
+        out["image_b64"] = base64.b64encode(raw).decode("ascii")
+    if save:
+        p = os.path.abspath(save)
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(raw)
+        out["save_path"] = p
+    return out
+
+
+def _model_b64(img: Any) -> str:
+    mx, q = 1440, 72
+    w, h = img.size
+    if max(w, h) > mx:
+        img = img.copy()
+        img.thumbnail((mx, mx))
+    if getattr(img, "mode", "") not in {"RGB", "L"}:
+        img = img.convert("RGB")
+    b = BytesIO()
+    img.save(b, format="JPEG", quality=q, optimize=True)
+    return base64.b64encode(b.getvalue()).decode("ascii")
+
+
+def _cap_model() -> tuple[bytes, str, int, int]:
     img = pyautogui.screenshot()
     w, h = img.size
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    raw = buf.getvalue()
-    return img, (w, h), raw
-
-
-def _to_model_b64(img: Any) -> str:
-    # Reduce payload size for lower latency and fewer transport errors.
-    w, h = img.size
-    if max(w, h) > MODEL_MAX_IMAGE_SIDE:
-        img = img.copy()
-        img.thumbnail((MODEL_MAX_IMAGE_SIDE, MODEL_MAX_IMAGE_SIDE))
-    if getattr(img, "mode", "") not in ("RGB", "L"):
-        img = img.convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=MODEL_IMAGE_QUALITY, optimize=True)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    raw, _, _ = _encode(img, fmt="png", quality=90)
+    return raw, _model_b64(img), int(w), int(h)
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    text = text.strip()
+    t = text.strip()
     try:
-        return json.loads(text)
+        return json.loads(t)
     except Exception:
         pass
-    m = re.search(r"\{[\s\S]*\}", text)
+    m = re.search(r"\{[\s\S]*\}", t)
     if not m:
-        raise ValueError(f"model did not return JSON: {text[:220]}")
+        raise ValueError(f"model did not return json: {t[:180]}")
     return json.loads(m.group(0))
 
 
-def _call_json(
-    client: dict[str, str],
-    system_prompt: str,
-    user_text: str,
-    with_screenshot: bool = True,
-    screenshot_b64: Optional[str] = None,
-) -> dict[str, Any]:
-    content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-    if with_screenshot:
-        b64 = screenshot_b64
-        if not b64:
-            img, _, _ = _capture_screenshot()
-            b64 = _to_model_b64(img)
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(MODEL_RETRIES + 1):
+def _call_json(client: dict[str, str], sys_prompt: str, user_text: str, b64: Optional[str] = None) -> dict[str, Any]:
+    c: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
+    if b64:
+        c.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    timeout = 18.0
+    retries = 1
+    last: Optional[Exception] = None
+    for i in range(retries + 1):
         try:
-            resp = completion(
+            r = completion(
                 model=client["model"],
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": content},
-                ],
+                messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": c}],
                 api_key=client["api_key"],
                 api_base=client["api_base"],
+                timeout=timeout,
                 temperature=1,
-                timeout=MODEL_TIMEOUT_SEC,
             )
-            raw = (resp.choices[0].message.content or "").strip()
-            return _extract_json(raw)
-        except Exception as exc:
-            last_exc = exc
-            message = str(exc).lower()
-            retryable = any(
-                token in message
-                for token in (
-                    "ssl",
-                    "eof",
-                    "timeout",
-                    "timed out",
-                    "connection",
-                    "temporar",
-                    "429",
-                    "500",
-                    "502",
-                    "503",
-                    "504",
-                    "internalservererror",
-                )
-            )
-            if attempt >= MODEL_RETRIES or not retryable:
+            return _extract_json((r.choices[0].message.content or "").strip())
+        except Exception as e:
+            last = e
+            if i >= retries:
                 break
-            time.sleep(min(0.8 * (2**attempt), 2.2))
-    if last_exc is None:
-        raise RuntimeError("model call failed without exception")
-    raise last_exc
+            time.sleep(min(0.8 * (2**i), 2.2))
+    raise last or RuntimeError("model call failed")
 
 
-def _inspect_screen(client: dict[str, str], verify_condition: str = "", screenshot_b64: Optional[str] = None) -> dict[str, Any]:
-    user_text = "Describe current screen"
-    if verify_condition.strip():
-        user_text = f"Condition: {verify_condition.strip()}"
-    system_prompt = (
-        "You are a desktop vision observer and verifier. Return strict JSON only: "
+def observe(condition: str = "", include_base64: bool = False, save: str = "") -> dict[str, Any]:
+    client = _client()
+    raw_png, b64, w, h = _cap_model()
+    sys_prompt = (
+        "You are a desktop vision observer/verifier. Return strict JSON only: "
         '{"summary":"...","focus_window":"...","key_text":["..."],"ok":true/false,"reason":"..."}. '
-        "If no condition is provided, set ok=true and reason='n/a'. Keep summary short and factual."
+        "If no condition provided, set ok=true and reason='n/a'."
     )
-    return _call_json(client, system_prompt, user_text, with_screenshot=True, screenshot_b64=screenshot_b64)
+    user = f"Condition: {condition.strip()}" if condition.strip() else "Describe current screen"
+    try:
+        out = _call_json(client, sys_prompt, user, b64=b64)
+    except Exception as e:
+        out = {
+            "summary": "model_observe_unavailable",
+            "focus_window": "",
+            "key_text": [],
+            "ok": False,
+            "reason": str(e),
+        }
+    out["screen_size"] = {"width": w, "height": h}
+    if include_base64:
+        out["image_b64"] = base64.b64encode(raw_png).decode("ascii")
+    if save:
+        p = os.path.abspath(save)
+        d = os.path.dirname(p)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(raw_png)
+        out["screenshot"] = p
+    return out
 
 
-def _summarize_screen(client: dict[str, str]) -> dict[str, Any]:
-    data = _inspect_screen(client)
-    return {
-        "summary": data.get("summary", ""),
-        "focus_window": data.get("focus_window", ""),
-        "key_text": data.get("key_text", []),
-    }
+SHORTCUTS = {
+    "copy": ["ctrl", "c"],
+    "paste": ["ctrl", "v"],
+    "cut": ["ctrl", "x"],
+    "undo": ["ctrl", "z"],
+    "redo": ["ctrl", "y"],
+    "save": ["ctrl", "s"],
+    "select_all": ["ctrl", "a"],
+    "find": ["ctrl", "f"],
+    "close_window": ["alt", "f4"],
+    "task_manager": ["ctrl", "shift", "esc"],
+    "lock_screen": ["win", "l"],
+    "show_desktop": ["win", "d"],
+    "file_explorer": ["win", "e"],
+    "run": ["win", "r"],
+    "settings": ["win", "i"],
+    "snipping_tool": ["win", "shift", "s"],
+    "emoji": ["win", "."],
+    "new_desktop": ["ctrl", "win", "d"],
+    "close_desktop": ["ctrl", "win", "f4"],
+    "next_desktop": ["ctrl", "win", "right"],
+    "prev_desktop": ["ctrl", "win", "left"],
+    "delete": ["delete"],
+    "hard_delete": ["shift", "delete"],
+}
 
 
-def _verify(client: dict[str, str], condition: str, tries: int, interval: float) -> tuple[bool, str]:
-    reason = ""
-    for _ in range(max(1, tries)):
-        data = _inspect_screen(client, verify_condition=condition)
-        ok = bool(data.get("ok", False))
-        reason = str(data.get("reason", "")).strip()
-        if ok:
-            return True, reason
-        time.sleep(max(0.5, interval))
-    return False, reason
+def _mouse() -> dict[str, int]:
+    p = pyautogui.position()
+    return {"x": int(p.x), "y": int(p.y)}
 
 
-def _clamp_xy(x: int, y: int) -> tuple[int, int]:
-    sw, sh = pyautogui.size()
-    return max(0, min(sw - 1, int(x))), max(0, min(sh - 1, int(y)))
+def act(a: dict[str, Any]) -> dict[str, Any]:
+    t = str(a.get("type", "")).strip().lower()
+    if not t:
+        raise ValueError("action.type required")
 
+    if t == "position":
+        w, h = _screen()
+        return {"ok": True, "action": t, "mouse": _mouse(), "screen_size": {"width": w, "height": h}}
 
-def run_action(action: dict[str, Any]) -> str:
-    t = str(action.get("type", "")).strip().lower()
-    if t in ("move", "click", "double_click"):
-        x, y = _clamp_xy(action.get("x", 0), action.get("y", 0))
-        if t == "move":
-            pyautogui.moveTo(x, y, duration=0.12)
-        elif t == "click":
-            pyautogui.click(x=x, y=y)
+    if t == "screenshot":
+        return capture(
+            include_base64=_to_bool(a.get("include_base64"), True),
+            save=str(a.get("save", "") or a.get("save_path", "")).strip(),
+            fmt=str(a.get("format", "png")),
+            quality=_to_int(a.get("quality"), 82),
+            region=a.get("region"),
+        )
+
+    if t in {"move", "move_to"}:
+        x, y = _xy(_to_int(a.get("x"), 0), _to_int(a.get("y"), 0))
+        pyautogui.moveTo(x, y, duration=max(0.0, min(8.0, _to_float(a.get("duration"), 0.12))))
+        return {"ok": True, "action": "move", "result": f"move({x},{y})", "mouse": _mouse()}
+
+    if t in {"move_rel", "move_relative"}:
+        dx, dy = _to_int(a.get("dx"), 0), _to_int(a.get("dy"), 0)
+        pyautogui.moveRel(dx, dy, duration=max(0.0, min(8.0, _to_float(a.get("duration"), 0.12))))
+        return {"ok": True, "action": "move_rel", "result": f"move_rel({dx},{dy})", "mouse": _mouse()}
+
+    if t in {"click", "double_click", "right_click", "middle_click"}:
+        if t == "right_click":
+            b, c = "right", 1
+        elif t == "middle_click":
+            b, c = "middle", 1
         else:
-            pyautogui.doubleClick(x=x, y=y)
-        return f"{t}({x},{y})"
+            b, c = _button(a.get("button", "left")), (2 if t == "double_click" else max(1, min(6, _to_int(a.get("clicks"), 1))))
+        iv = max(0.0, min(2.0, _to_float(a.get("interval"), 0.08)))
+        x, y = a.get("x"), a.get("y")
+        if x is not None and y is not None:
+            px, py = _xy(_to_int(x, 0), _to_int(y, 0))
+            pyautogui.click(x=px, y=py, clicks=c, interval=iv, button=b)
+        else:
+            pyautogui.click(clicks=c, interval=iv, button=b)
+        return {"ok": True, "action": "click", "result": f"click(button={b},clicks={c})", "mouse": _mouse()}
+
+    if t in {"mouse_down", "mouse_up"}:
+        b = _button(a.get("button", "left"))
+        x, y = a.get("x"), a.get("y")
+        if x is not None and y is not None:
+            px, py = _xy(_to_int(x, 0), _to_int(y, 0))
+            (pyautogui.mouseDown if t == "mouse_down" else pyautogui.mouseUp)(x=px, y=py, button=b)
+        else:
+            (pyautogui.mouseDown if t == "mouse_down" else pyautogui.mouseUp)(button=b)
+        return {"ok": True, "action": t, "result": f"{t}(button={b})", "mouse": _mouse()}
+
+    if t in {"drag_to", "drag"}:
+        x, y = _xy(_to_int(a.get("x"), 0), _to_int(a.get("y"), 0))
+        b = _button(a.get("button", "left"))
+        pyautogui.dragTo(x, y, duration=max(0.0, min(12.0, _to_float(a.get("duration"), 0.2))), button=b)
+        return {"ok": True, "action": "drag_to", "result": f"drag_to({x},{y},button={b})", "mouse": _mouse()}
+
+    if t in {"drag_rel", "drag_relative"}:
+        dx, dy = _to_int(a.get("dx"), 0), _to_int(a.get("dy"), 0)
+        b = _button(a.get("button", "left"))
+        pyautogui.dragRel(dx, dy, duration=max(0.0, min(12.0, _to_float(a.get("duration"), 0.2))), button=b)
+        return {"ok": True, "action": "drag_rel", "result": f"drag_rel({dx},{dy},button={b})", "mouse": _mouse()}
+
+    if t in {"scroll", "wheel"}:
+        amt = _to_int(a.get("amount"), -300)
+        x, y = a.get("x"), a.get("y")
+        if x is not None and y is not None:
+            px, py = _xy(_to_int(x, 0), _to_int(y, 0))
+            pyautogui.scroll(amt, x=px, y=py)
+        else:
+            pyautogui.scroll(amt)
+        return {"ok": True, "action": "scroll", "result": f"scroll({amt})", "mouse": _mouse()}
+
+    if t in {"hscroll", "scroll_horizontal"}:
+        if not hasattr(pyautogui, "hscroll"):
+            raise RuntimeError("hscroll not supported")
+        amt = _to_int(a.get("amount"), -200)
+        x, y = a.get("x"), a.get("y")
+        if x is not None and y is not None:
+            px, py = _xy(_to_int(x, 0), _to_int(y, 0))
+            pyautogui.hscroll(amt, x=px, y=py)
+        else:
+            pyautogui.hscroll(amt)
+        return {"ok": True, "action": "hscroll", "result": f"hscroll({amt})", "mouse": _mouse()}
+
     if t == "type":
-        text = str(action.get("text", ""))
-        pyautogui.write(text, interval=0.01)
-        return f"type({len(text)} chars)"
+        txt = str(a.get("text", ""))
+        if not txt:
+            raise ValueError("type requires text")
+        pyautogui.write(txt, interval=max(0.0, min(0.5, _to_float(a.get("interval"), 0.01))))
+        return {"ok": True, "action": "type", "result": f"type({len(txt)} chars)", "mouse": _mouse()}
+
+    if t in {"press", "key_press"}:
+        k = _key(a.get("key"))
+        n = max(1, min(300, _to_int(a.get("presses"), 1)))
+        pyautogui.press(k, presses=n, interval=max(0.0, min(2.0, _to_float(a.get("interval"), 0.05))))
+        return {"ok": True, "action": "press", "result": f"press({k},presses={n})", "mouse": _mouse()}
+
+    if t in {"delete", "backspace"}:
+        n = max(1, min(300, _to_int(a.get("presses"), 1)))
+        pyautogui.press("delete" if t == "delete" else "backspace", presses=n, interval=0.03)
+        return {"ok": True, "action": t, "result": f"{t}(presses={n})", "mouse": _mouse()}
+
+    if t == "key_down":
+        k = _key(a.get("key"))
+        pyautogui.keyDown(k)
+        return {"ok": True, "action": t, "result": f"key_down({k})", "mouse": _mouse()}
+
+    if t == "key_up":
+        k = _key(a.get("key"))
+        pyautogui.keyUp(k)
+        return {"ok": True, "action": t, "result": f"key_up({k})", "mouse": _mouse()}
+
     if t == "hotkey":
-        keys = action.get("keys", [])
-        if isinstance(keys, list) and keys:
-            keys = [str(k).strip().lower() for k in keys if str(k).strip()]
-            pyautogui.hotkey(*keys)
-            return "hotkey(" + "+".join(keys) + ")"
-        return "hotkey(noop)"
-    if t == "press":
-        key = str(action.get("key", "")).strip().lower()
-        if key:
-            pyautogui.press(key)
-            return f"press({key})"
-        return "press(noop)"
-    if t == "scroll":
-        amount = int(action.get("amount", -300))
-        pyautogui.scroll(amount)
-        return f"scroll({amount})"
+        ks = _keys(a.get("keys"))
+        pyautogui.hotkey(*ks)
+        return {"ok": True, "action": t, "result": "hotkey(" + "+".join(ks) + ")", "mouse": _mouse()}
+
+    if t == "shortcut":
+        n = str(a.get("name", "")).strip().lower()
+        if not n:
+            raise ValueError("shortcut requires name")
+        ks = SHORTCUTS.get(n)
+        if not ks:
+            raise ValueError("unknown shortcut")
+        pyautogui.hotkey(*ks)
+        return {"ok": True, "action": t, "name": n, "result": "hotkey(" + "+".join(ks) + ")", "mouse": _mouse()}
+
     if t == "wait":
-        sec = float(action.get("seconds", 0.8))
-        sec = max(0.0, min(12.0, sec))
-        time.sleep(sec)
-        return f"wait({sec:.1f}s)"
-    if t == "read_screen":
-        return "read_screen"
+        s = max(0.0, min(120.0, _to_float(a.get("seconds"), 0.8)))
+        time.sleep(s)
+        return {"ok": True, "action": t, "result": f"wait({s:.2f}s)", "mouse": _mouse()}
+
     raise ValueError(f"unsupported action type: {t}")
 
 
-def decide_next_step(client: dict[str, str], goal: str, history: list[str]) -> dict[str, Any]:
-    sw, sh = pyautogui.size()
-    px, py = pyautogui.position()
-    history_text = "\n".join(history[-10:]) if history else "(empty)"
-    system_prompt = f"""
-You are the ONLY planner for desktop GUI tasks.
-Return strict JSON only in this schema:
-{{
-  "done": true/false,
-  "reason": "short reason",
-  "action": {{
-    "type":"move|click|double_click|type|hotkey|press|scroll|wait|read_screen",
-    "x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8
-  }},
-  "verify": "one visual condition after this action"
-}}
-Rules:
-- One action per step.
-- Coordinates must be in screen bounds x:[0,{sw-1}] y:[0,{sh-1}].
-- If uncertain, use read_screen or wait, never random click.
-- done=true only when goal is visibly completed.
-Current mouse: ({px},{py})
-""".strip()
-    user_text = f"Goal: {goal}\nHistory:\n{history_text}\nGive next step."
-    return _call_json(client, system_prompt, user_text, with_screenshot=True)
+def batch(actions: list[dict[str, Any]], continue_on_error: bool = False, sleep_between: float = 0.0) -> dict[str, Any]:
+    logs: list[dict[str, Any]] = []
+    for i, a in enumerate(actions, start=1):
+        try:
+            logs.append({"index": i, "ok": True, "action": a, "result": act(a)})
+        except Exception as e:
+            logs.append({"index": i, "ok": False, "action": a, "error": str(e)})
+            if not continue_on_error:
+                return {"ok": False, "stopped_at": i, "logs": logs}
+        if sleep_between > 0 and i < len(actions):
+            time.sleep(min(10.0, max(0.0, sleep_between)))
+    return {"ok": all(x.get("ok") for x in logs), "logs": logs}
 
 
-def cmd_observe(args: argparse.Namespace) -> int:
-    client = load_client()
-    img, (w, h), raw = _capture_screenshot()
-    b64 = _to_model_b64(img)
-    data = _inspect_screen(client, screenshot_b64=b64)
-    data["screen_size"] = {"width": w, "height": h}
-    data.pop("ok", None)
-    data.pop("reason", None)
-    if args.save:
-        path = os.path.abspath(args.save)
-        with open(path, "wb") as f:
-            f.write(raw)
-        data["screenshot"] = path
-    if args.json:
-        print(json.dumps(data, ensure_ascii=False))
-    else:
-        print(f"summary: {data.get('summary', '')}")
-        print(f"focus_window: {data.get('focus_window', '')}")
-        keys = data.get("key_text", [])
-        if isinstance(keys, list) and keys:
-            print("key_text:")
-            for k in keys[:12]:
-                print(f"- {k}")
-    return 0
-
-
-def cmd_action(args: argparse.Namespace) -> int:
-    action: dict[str, Any]
-    if args.action_name in {"move", "click", "double_click"}:
-        action = {"type": args.action_name, "x": args.x, "y": args.y}
-    elif args.action_name == "type":
-        action = {"type": "type", "text": args.text}
-    elif args.action_name == "hotkey":
-        keys = [k.strip().lower() for k in re.split(r"[+\s]+", args.keys) if k.strip()]
-        action = {"type": "hotkey", "keys": keys}
-    elif args.action_name == "press":
-        action = {"type": "press", "key": args.key}
-    elif args.action_name == "scroll":
-        action = {"type": "scroll", "amount": args.amount}
-    else:
-        action = {"type": "wait", "seconds": args.seconds}
-
-    result = run_action(action)
-    print(result)
-    return 0
-
-
-def cmd_goal(args: argparse.Namespace) -> int:
-    client = load_client()
-    goal = args.goal.strip()
-    history: list[str] = []
-    deadline = time.monotonic() + GOAL_DEADLINE_SEC
-
-    if args.json:
-        logs: list[dict[str, Any]] = []
-
-    for step in range(1, max(1, args.max_steps) + 1):
-        required_budget = MODEL_TIMEOUT_SEC * (1 + max(1, int(args.verify_tries))) + 3.0
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or (step > 1 and remaining < required_budget):
-            if args.json:
-                print(
-                    json.dumps(
-                        {"ok": False, "error": "deadline_exceeded", "deadline_sec": GOAL_DEADLINE_SEC, "logs": logs},
-                        ensure_ascii=False,
-                    )
-                )
-            else:
-                print("stop: deadline exceeded")
-            return 1
-
-        decision = decide_next_step(client, goal, history)
-        done = bool(decision.get("done", False))
-        reason = str(decision.get("reason", "")).strip()
-
-        if done:
-            if args.json:
-                logs.append({"step": step, "done": True, "reason": reason})
-                print(json.dumps({"ok": True, "logs": logs}, ensure_ascii=False))
-            else:
-                print(f"done: {reason or 'completed'}")
-            return 0
-
-        action = decision.get("action", {})
-        if not isinstance(action, dict) or not action:
-            err = "invalid action from model"
-            if args.json:
-                print(json.dumps({"ok": False, "error": err}, ensure_ascii=False))
-            else:
-                print(f"error: {err}")
-            return 2
-
-        verify = str(decision.get("verify", "")).strip() or "screen moved toward goal"
-        result = run_action(action)
-
-        observe_condition = "" if str(action.get("type", "")).lower() == "read_screen" else verify
-        obs: dict[str, Any] = {}
-        ok = not observe_condition
-        reason2 = "screen captured"
-        for attempt in range(max(1, args.verify_tries)):
-            obs = _inspect_screen(client, verify_condition=observe_condition)
-            if not observe_condition:
-                break
-            ok = bool(obs.get("ok", False))
-            reason2 = str(obs.get("reason", "")).strip()
-            if ok or attempt >= max(1, args.verify_tries) - 1:
-                break
-            time.sleep(max(0.5, float(args.verify_interval)))
-
-        history.append(
-            f"step={step}; action={result}; verify={verify}; ok={ok}; reason={reason2}; summary={obs.get('summary','')}"
+def goal_run(goal: str, max_steps: int) -> dict[str, Any]:
+    client = _client()
+    logs: list[dict[str, Any]] = []
+    hist: list[str] = []
+    deadline = time.monotonic() + 120.0
+    for step in range(1, max(1, max_steps) + 1):
+        if time.monotonic() > deadline:
+            return {"ok": False, "error": "deadline_exceeded", "logs": logs}
+        raw_png, b64, w, h = _cap_model()
+        _ = raw_png
+        sys_prompt = (
+            "Return strict JSON only: "
+            '{"done":true/false,"reason":"...","action":{"type":"move|click|double_click|right_click|type|hotkey|press|scroll|wait|screenshot","x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8},"verify":"..."}. '
+            "One action per step. Use in-screen coordinates only."
         )
-
-        if args.json:
-            logs.append(
-                {
-                    "step": step,
-                    "action": result,
-                    "verify": verify,
-                    "verify_ok": ok,
-                    "verify_reason": reason2,
-                    "summary": obs.get("summary", ""),
-                }
-            )
-        else:
-            print(f"[{step}] action: {result}")
-            print(f"    verify: {'ok' if ok else 'no'} | {verify}")
-            if reason2:
-                print(f"    reason: {reason2}")
-            print(f"    observe: {obs.get('summary','')}")
-
-    if args.json:
-        print(json.dumps({"ok": False, "error": "max_steps_reached", "logs": logs}, ensure_ascii=False))
-    else:
-        print("stop: max steps reached")
-    return 1
+        user = f"Goal: {goal}\nScreen: {w}x{h}\nHistory:\n" + ("\n".join(hist[-12:]) if hist else "(empty)")
+        dec = _call_json(client, sys_prompt, user, b64=b64)
+        if _to_bool(dec.get("done"), False):
+            logs.append({"step": step, "done": True, "reason": str(dec.get("reason", ""))})
+            return {"ok": True, "logs": logs}
+        action = dec.get("action")
+        if not isinstance(action, dict):
+            return {"ok": False, "error": "invalid action", "logs": logs}
+        verify = str(dec.get("verify", "")).strip() or "screen moved toward goal"
+        ar = act(action)
+        obs = observe(condition=verify)
+        ok = _to_bool(obs.get("ok"), False)
+        rs = str(obs.get("reason", "")).strip()
+        hist.append(f"step={step}; action={ar.get('result','')}; verify={verify}; ok={ok}; reason={rs}; summary={obs.get('summary','')}")
+        logs.append({"step": step, "action": ar, "verify": verify, "verify_ok": ok, "verify_reason": rs, "summary": obs.get("summary", "")})
+    return {"ok": False, "error": "max_steps_reached", "logs": logs}
 
 
-def mcp_tools_list() -> list[dict[str, Any]]:
+def tools() -> list[dict[str, Any]]:
     return [
-        {
-            "name": "desktop_observe",
-            "description": "Capture current screen and return vision summary (third-party model).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "save": {"type": "string", "description": "Optional png path to save screenshot."}
-                },
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "desktop_goal",
-            "description": "Execute a GUI task by model planning with per-step visual verification.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "goal": {"type": "string"},
-                    "max_steps": {"type": "integer", "minimum": 1, "default": 8},
-                    "verify_tries": {"type": "integer", "minimum": 1, "default": 2},
-                    "verify_interval": {"type": "number", "minimum": 0.5, "default": 1.8},
-                },
-                "required": ["goal"],
-                "additionalProperties": False,
-            },
-        },
-        {
-            "name": "desktop_action",
-            "description": "Run one direct desktop action.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": ["move", "click", "double_click", "type", "hotkey", "press", "scroll", "wait"],
-                    },
-                    "x": {"type": "integer"},
-                    "y": {"type": "integer"},
-                    "text": {"type": "string"},
-                    "keys": {"type": "array", "items": {"type": "string"}},
-                    "key": {"type": "string"},
-                    "amount": {"type": "integer"},
-                    "seconds": {"type": "number"},
-                },
-                "required": ["type"],
-                "additionalProperties": False,
-            },
-        },
+        {"name": "desktop_capture", "description": "Capture screenshot.", "inputSchema": {"type": "object"}},
+        {"name": "desktop_observe", "description": "Observe screenshot with model.", "inputSchema": {"type": "object"}},
+        {"name": "desktop_action", "description": "Run one mouse/keyboard action.", "inputSchema": {"type": "object"}},
+        {"name": "desktop_batch", "description": "Run action batch.", "inputSchema": {"type": "object"}},
+        {"name": "desktop_goal", "description": "Optional model-planned task.", "inputSchema": {"type": "object"}},
     ]
 
 
-def mcp_call_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    if name == "desktop_observe":
-        client = load_client()
-        img, (w, h), raw = _capture_screenshot()
-        b64 = _to_model_b64(img)
-        data = _inspect_screen(client, screenshot_b64=b64)
-        data["screen_size"] = {"width": w, "height": h}
-        data.pop("ok", None)
-        data.pop("reason", None)
-        save_path = str(arguments.get("save", "")).strip()
-        if save_path:
-            path = os.path.abspath(save_path)
-            with open(path, "wb") as f:
-                f.write(raw)
-            data["screenshot"] = path
-        return data
-
-    if name == "desktop_goal":
-        ns = argparse.Namespace(
-            goal=str(arguments.get("goal", "")),
-            max_steps=int(arguments.get("max_steps", 8)),
-            verify_tries=int(arguments.get("verify_tries", 2)),
-            verify_interval=float(arguments.get("verify_interval", 1.8)),
-            json=True,
+def call_tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+    if name == "desktop_capture":
+        return capture(
+            include_base64=_to_bool(args.get("include_base64"), True),
+            save=str(args.get("save", "")).strip(),
+            fmt=str(args.get("format", "png")),
+            quality=_to_int(args.get("quality"), 82),
+            region=args.get("region"),
         )
-        if not ns.goal:
-            raise ValueError("goal is required")
-        old_stdout = sys.stdout
-        try:
-            from io import StringIO
-
-            buf = StringIO()
-            sys.stdout = buf
-            code = cmd_goal(ns)
-            output = buf.getvalue().strip()
-        finally:
-            sys.stdout = old_stdout
-        if output:
-            try:
-                payload = json.loads(output)
-            except Exception:
-                payload = {"ok": code == 0, "raw": output}
-        else:
-            payload = {"ok": code == 0}
-        return payload
-
+    if name == "desktop_observe":
+        return observe(
+            condition=str(args.get("condition", "")).strip(),
+            include_base64=_to_bool(args.get("include_base64"), False),
+            save=str(args.get("save", "")).strip(),
+        )
     if name == "desktop_action":
-        t = str(arguments.get("type", "")).strip().lower()
-        action: dict[str, Any] = {"type": t}
-        if t in {"move", "click", "double_click"}:
-            action["x"] = int(arguments["x"])
-            action["y"] = int(arguments["y"])
-        elif t == "type":
-            action["text"] = str(arguments.get("text", ""))
-        elif t == "hotkey":
-            keys = arguments.get("keys", [])
-            if isinstance(keys, str):
-                keys = [k for k in re.split(r"[+\s]+", keys) if k]
-            action["keys"] = keys
-        elif t == "press":
-            action["key"] = str(arguments.get("key", ""))
-        elif t == "scroll":
-            action["amount"] = int(arguments.get("amount", -300))
-        elif t == "wait":
-            action["seconds"] = float(arguments.get("seconds", 0.8))
-        result = run_action(action)
-        return {"result": result}
-
+        a = dict(args)
+        if isinstance(a.get("keys"), str):
+            a["keys"] = _keys(a["keys"])
+        return act(a)
+    if name == "desktop_batch":
+        acts = args.get("actions", [])
+        if not isinstance(acts, list):
+            raise ValueError("actions must be list")
+        return batch(
+            acts,
+            continue_on_error=_to_bool(args.get("continue_on_error"), False),
+            sleep_between=max(0.0, min(10.0, _to_float(args.get("sleep_between"), 0.0))),
+        )
+    if name == "desktop_goal":
+        return goal_run(str(args.get("goal", "")), max_steps=max(1, _to_int(args.get("max_steps"), 10)))
     raise ValueError(f"unknown tool: {name}")
 
 
-def mcp_handle_request(req: dict[str, Any]) -> Optional[dict[str, Any]]:
-    req_id = req.get("id")
+def handle(req: dict[str, Any]) -> Optional[dict[str, Any]]:
+    rid = req.get("id")
     method = req.get("method")
     params = req.get("params") or {}
     try:
         if method == "initialize":
-            client_proto = params.get("protocolVersion")
-            result = {
-                "protocolVersion": client_proto or "2024-11-05",
-                "serverInfo": {"name": "desktop-mcp", "version": "0.1.0"},
+            r = {
+                "protocolVersion": params.get("protocolVersion") or "2024-11-05",
+                "serverInfo": {"name": "desktop-mcp", "version": "1.0.0"},
                 "capabilities": {"tools": {"listChanged": False}},
             }
         elif method == "notifications/initialized":
             return None
         elif method == "ping":
-            result = {}
+            r = {}
         elif method == "tools/list":
-            result = {"tools": mcp_tools_list()}
+            r = {"tools": tools()}
         elif method == "tools/call":
-            name = str(params.get("name", "")).strip()
-            arguments = params.get("arguments") or {}
-            data = mcp_call_tool(name, arguments)
-            result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}], "isError": False}
+            data = call_tool(str(params.get("name", "")).strip(), params.get("arguments") or {})
+            r = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}], "isError": False}
         else:
-            if req_id is None:
+            if rid is None:
                 return None
             raise ValueError(f"unsupported method: {method}")
-        if req_id is None:
+        if rid is None:
             return None
-        return {"jsonrpc": "2.0", "id": req_id, "result": result}
-    except Exception as exc:
-        if req_id is None:
+        return {"jsonrpc": "2.0", "id": rid, "result": r}
+    except Exception as e:
+        if rid is None:
             return None
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32000, "message": str(exc)},
-        }
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e)}}
 
 
-def _read_stdio_message() -> tuple[Optional[str], str]:
-    stream = sys.stdin.buffer
-    first = stream.readline()
+def _read_msg() -> tuple[Optional[str], str]:
+    s = sys.stdin.buffer
+    first = s.readline()
     if not first:
         return None, "eof"
-
-    # JSON line mode fallback
     if not first.lower().startswith(b"content-length:"):
-        text = first.decode("utf-8", errors="replace").lstrip("\ufeff").strip()
-        if not text:
-            return _read_stdio_message()
-        return text, "jsonline"
-
-    # Content-Length framed mode
-    header_line = first.decode("ascii", errors="ignore").strip()
-    m = re.match(r"content-length:\s*(\d+)", header_line, flags=re.IGNORECASE)
+        t = first.decode("utf-8", errors="replace").lstrip("\ufeff").strip()
+        if not t:
+            return _read_msg()
+        return t, "jsonline"
+    h = first.decode("ascii", errors="ignore").strip()
+    m = re.match(r"content-length:\s*(\d+)", h, flags=re.IGNORECASE)
     if not m:
         raise ValueError("invalid Content-Length header")
-    content_length = int(m.group(1))
-
+    n = int(m.group(1))
     while True:
-        line = stream.readline()
-        if not line:
+        line = s.readline()
+        if not line or line in (b"\r\n", b"\n"):
             break
-        if line in (b"\r\n", b"\n"):
-            break
-
-    body = stream.read(content_length)
-    if body is None:
+    b = s.read(n)
+    if b is None:
         return None, "eof"
-    return body.decode("utf-8", errors="replace").lstrip("\ufeff"), "framed"
+    return b.decode("utf-8", errors="replace").lstrip("\ufeff"), "framed"
 
 
-def _write_stdio_message(resp: dict[str, Any], mode: str) -> None:
-    text = json.dumps(resp, ensure_ascii=False)
-    out = sys.stdout.buffer
+def _write_msg(resp: dict[str, Any], mode: str) -> None:
+    t = json.dumps(resp, ensure_ascii=False)
+    o = sys.stdout.buffer
     if mode == "jsonline":
-        out.write((text + "\n").encode("utf-8"))
+        o.write((t + "\n").encode("utf-8"))
     else:
-        payload = text.encode("utf-8")
-        header = f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii")
-        out.write(header)
-        out.write(payload)
-    out.flush()
+        p = t.encode("utf-8")
+        o.write(f"Content-Length: {len(p)}\r\n\r\n".encode("ascii"))
+        o.write(p)
+    o.flush()
 
 
 def cmd_mcp_serve(_: argparse.Namespace) -> int:
     while True:
-        raw, mode = _read_stdio_message()
+        raw, mode = _read_msg()
         if raw is None:
             return 0
         raw = raw.strip()
         if not raw:
             continue
-        req = json.loads(raw)
-        resp = mcp_handle_request(req)
+        resp = handle(json.loads(raw))
         if resp is not None:
-            _write_stdio_message(resp, mode)
+            _write_msg(resp, mode)
 
 
 def cmd_mcp(args: argparse.Namespace) -> int:
-    if args.request:
-        raw = args.request
-    else:
-        raw = sys.stdin.read()
-    raw = raw.lstrip("\ufeff").strip()
-    req = json.loads(raw)
-    resp = mcp_handle_request(req)
-    print(json.dumps(resp, ensure_ascii=False))
+    raw = args.request if args.request else sys.stdin.read()
+    req = json.loads(raw.lstrip("\ufeff").strip())
+    print(json.dumps(handle(req), ensure_ascii=True))
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="desktop-mcp", description="Desktop automation bridge (third-party model planner)")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    p_obs = sub.add_parser("observe", help="Read current screen by model")
-    p_obs.add_argument("--save", help="save screenshot png path")
-    p_obs.add_argument("--json", action="store_true", help="print JSON")
-    p_obs.set_defaults(func=cmd_observe)
-
-    p_goal = sub.add_parser("goal", help="Run a model-planned GUI goal")
-    p_goal.add_argument("goal", help="goal text")
-    p_goal.add_argument("--max-steps", type=int, default=8)
-    p_goal.add_argument("--verify-tries", type=int, default=2)
-    p_goal.add_argument("--verify-interval", type=float, default=1.8)
-    p_goal.add_argument("--json", action="store_true", help="print JSON logs")
-    p_goal.set_defaults(func=cmd_goal)
-
-    p_action = sub.add_parser("action", help="Run one direct input action")
-    p_action.add_argument("action_name", choices=["move", "click", "double_click", "type", "hotkey", "press", "scroll", "wait"])
-    p_action.add_argument("--x", type=int)
-    p_action.add_argument("--y", type=int)
-    p_action.add_argument("--text")
-    p_action.add_argument("--keys")
-    p_action.add_argument("--key")
-    p_action.add_argument("--amount", type=int, default=-300)
-    p_action.add_argument("--seconds", type=float, default=0.8)
-    p_action.set_defaults(func=cmd_action)
-
-    p_mcp = sub.add_parser("mcp", help="One-shot MCP-like JSON-RPC request")
-    p_mcp.add_argument("--request", help="JSON-RPC request string. If omitted, read stdin.")
-    p_mcp.set_defaults(func=cmd_mcp)
-
-    p_mcp_serve = sub.add_parser("mcp-serve", help="Run persistent stdio MCP server")
-    p_mcp_serve.set_defaults(func=cmd_mcp_serve)
-
-    return parser
+def cmd_observe(args: argparse.Namespace) -> int:
+    data = observe(condition=str(args.condition or ""), include_base64=args.include_base64, save=str(args.save or ""))
+    if args.json:
+        print(json.dumps(data, ensure_ascii=True))
+    else:
+        print(f"summary: {data.get('summary', '')}")
+        print(f"focus_window: {data.get('focus_window', '')}")
+    return 0
 
 
-def validate_action_args(args: argparse.Namespace) -> None:
+def cmd_capture(args: argparse.Namespace) -> int:
+    rg = None
+    if args.x is not None and args.y is not None and args.width is not None and args.height is not None:
+        rg = {"x": args.x, "y": args.y, "width": args.width, "height": args.height}
+    data = capture(include_base64=not args.no_base64, save=str(args.save or ""), fmt=args.format, quality=args.quality, region=rg)
+    print(json.dumps(data, ensure_ascii=True) if args.json else data.get("save_path", f"capture {data.get('width')}x{data.get('height')}"))
+    return 0
+
+
+def _act_cli(args: argparse.Namespace) -> dict[str, Any]:
+    a: dict[str, Any] = {"type": args.action_name}
+    for k in ["x", "y", "dx", "dy", "text", "key", "keys", "button", "clicks", "interval", "duration", "amount", "seconds", "presses", "name", "save", "format", "quality", "include_base64"]:
+        v = getattr(args, k, None)
+        if v is not None:
+            a[k] = v
+    if args.region:
+        p = [i.strip() for i in args.region.split(",") if i.strip()]
+        if len(p) != 4:
+            raise ValueError("--region must be x,y,width,height")
+        a["region"] = {"x": _to_int(p[0], 0), "y": _to_int(p[1], 0), "width": _to_int(p[2], 0), "height": _to_int(p[3], 0)}
+    if isinstance(a.get("keys"), str):
+        a["keys"] = _keys(a["keys"])
+    return a
+
+
+def cmd_action(args: argparse.Namespace) -> int:
     name = args.action_name
-    if name in {"move", "click", "double_click"}:
-        if args.x is None or args.y is None:
-            raise ValueError("--x and --y are required for move/click/double_click")
-    elif name == "type":
-        if args.text is None:
-            raise ValueError("--text is required for type")
-    elif name == "hotkey":
-        if args.keys is None:
-            raise ValueError("--keys is required for hotkey")
-    elif name == "press":
-        if args.key is None:
-            raise ValueError("--key is required for press")
+    if name in {"move", "move_to", "drag_to", "drag"} and (args.x is None or args.y is None):
+        raise ValueError(f"{name} requires --x and --y")
+    if name == "type" and args.text is None:
+        raise ValueError("type requires --text")
+    if name in {"press", "key_press", "key_down", "key_up"} and args.key is None:
+        raise ValueError(f"{name} requires --key")
+    if name == "hotkey" and args.keys is None:
+        raise ValueError("hotkey requires --keys")
+    if name == "shortcut" and args.name is None:
+        raise ValueError("shortcut requires --name")
+    data = act(_act_cli(args))
+    print(json.dumps(data, ensure_ascii=True) if args.json else data.get("result", "ok"))
+    return 0
+
+
+def cmd_batch(args: argparse.Namespace) -> int:
+    if args.file:
+        with open(args.file, "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+    elif args.actions:
+        payload = json.loads(args.actions)
+    else:
+        raise ValueError("batch requires --file or --actions")
+    if isinstance(payload, dict) and "actions" in payload:
+        acts = payload["actions"]
+        cont = _to_bool(payload.get("continue_on_error"), args.continue_on_error)
+        gap = _to_float(payload.get("sleep_between"), args.sleep_between)
+    else:
+        acts = payload
+        cont = args.continue_on_error
+        gap = args.sleep_between
+    if not isinstance(acts, list):
+        raise ValueError("actions must be list")
+    data = batch(acts, continue_on_error=cont, sleep_between=gap)
+    print(json.dumps(data, ensure_ascii=True) if args.json else f"ok: {data.get('ok')}")
+    return 0 if data.get("ok") else 1
+
+
+def cmd_goal(args: argparse.Namespace) -> int:
+    data = goal_run(args.goal, max_steps=max(1, _to_int(args.max_steps, 10)))
+    print(json.dumps(data, ensure_ascii=True) if args.json else ("done" if data.get("ok") else data.get("error", "failed")))
+    return 0 if data.get("ok") else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="desktop-mcp", description="Windows desktop MCP bridge")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    o = sub.add_parser("observe")
+    o.add_argument("--condition", default="")
+    o.add_argument("--save")
+    o.add_argument("--include-base64", action="store_true")
+    o.add_argument("--json", action="store_true")
+    o.set_defaults(func=cmd_observe)
+
+    c = sub.add_parser("capture")
+    c.add_argument("--save")
+    c.add_argument("--format", default="png", choices=["png", "jpeg", "jpg"])
+    c.add_argument("--quality", type=int, default=82)
+    c.add_argument("--no-base64", action="store_true")
+    c.add_argument("--x", type=int)
+    c.add_argument("--y", type=int)
+    c.add_argument("--width", type=int)
+    c.add_argument("--height", type=int)
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(func=cmd_capture)
+
+    g = sub.add_parser("goal")
+    g.add_argument("goal")
+    g.add_argument("--max-steps", type=int, default=10)
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(func=cmd_goal)
+
+    a = sub.add_parser("action")
+    a.add_argument("action_name", choices=["position", "screenshot", "move", "move_to", "move_rel", "move_relative", "click", "double_click", "right_click", "middle_click", "mouse_down", "mouse_up", "drag_to", "drag", "drag_rel", "drag_relative", "scroll", "wheel", "hscroll", "scroll_horizontal", "type", "press", "key_press", "delete", "backspace", "key_down", "key_up", "hotkey", "shortcut", "wait"])
+    a.add_argument("--x", type=int)
+    a.add_argument("--y", type=int)
+    a.add_argument("--dx", type=int)
+    a.add_argument("--dy", type=int)
+    a.add_argument("--text")
+    a.add_argument("--key")
+    a.add_argument("--keys")
+    a.add_argument("--button", default="left")
+    a.add_argument("--clicks", type=int)
+    a.add_argument("--interval", type=float)
+    a.add_argument("--duration", type=float)
+    a.add_argument("--amount", type=int)
+    a.add_argument("--seconds", type=float)
+    a.add_argument("--presses", type=int)
+    a.add_argument("--name")
+    a.add_argument("--save")
+    a.add_argument("--format", choices=["png", "jpeg", "jpg"])
+    a.add_argument("--quality", type=int)
+    a.add_argument("--include-base64", action="store_true")
+    a.add_argument("--region", help="x,y,width,height")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_action)
+
+    b = sub.add_parser("batch")
+    b.add_argument("--file")
+    b.add_argument("--actions")
+    b.add_argument("--continue-on-error", action="store_true")
+    b.add_argument("--sleep-between", type=float, default=0.0)
+    b.add_argument("--json", action="store_true")
+    b.set_defaults(func=cmd_batch)
+
+    m = sub.add_parser("mcp")
+    m.add_argument("--request")
+    m.set_defaults(func=cmd_mcp)
+
+    ms = sub.add_parser("mcp-serve")
+    ms.set_defaults(func=cmd_mcp_serve)
+    return p
 
 
 def main() -> int:
-    # Default behavior for Codex MCP stdio launch: no args => persistent MCP server.
     if len(sys.argv) == 1:
         return cmd_mcp_serve(argparse.Namespace())
-
-    parser = build_parser()
-    args = parser.parse_args()
+    p = parser()
+    args = p.parse_args()
     try:
-        if args.cmd == "action":
-            validate_action_args(args)
         return int(args.func(args))
-    except Exception as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
         return 2
 
 

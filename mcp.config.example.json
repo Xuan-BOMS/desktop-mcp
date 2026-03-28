@@ -1,0 +1,9 @@
+{
+  "type": "stdio",
+  "command": "C:/Python312/python.exe",
+  "args": [
+    "C:/path/to/desktop-mcp/desktop_mcp.py",
+    "mcp-serve"
+  ],
+  "env": {}
+}
