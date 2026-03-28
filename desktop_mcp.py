@@ -7,10 +7,16 @@ import sys
 import time
 import winreg
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Optional
 
 import pyautogui
 from litellm import completion
+
+try:
+    import tomllib
+except Exception:  # pragma: no cover
+    tomllib = None
 
 
 pyautogui.FAILSAFE = True
@@ -51,6 +57,60 @@ def _read_user_env(name: str) -> str:
         return ""
 
 
+def _first_non_empty(*values: str) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _codex_home() -> Path:
+    raw = os.environ.get("CODEX_HOME", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".codex"
+
+
+def _read_codex_auth_key() -> str:
+    auth_path = _codex_home() / "auth.json"
+    if not auth_path.exists():
+        return ""
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    value = data.get("OPENAI_API_KEY", "")
+    return str(value).strip()
+
+
+def _read_codex_provider_defaults() -> dict[str, str]:
+    if tomllib is None:
+        return {}
+    home = _codex_home()
+    candidates = [home / "config.toml", home / "config_88.toml"]
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            cfg = tomllib.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        model = str(cfg.get("model", "")).strip()
+        provider = str(cfg.get("model_provider", "")).strip()
+        base_url = ""
+        providers = cfg.get("model_providers")
+        if provider and isinstance(providers, dict):
+            provider_cfg = providers.get(provider)
+            if isinstance(provider_cfg, dict):
+                base_url = str(provider_cfg.get("base_url", "")).strip()
+        if not base_url:
+            base_url = str(cfg.get("base_url", "")).strip()
+        if model or base_url:
+            return {"model": model, "api_base": base_url}
+    return {}
+
+
 MODEL_TIMEOUT_SEC = _read_float_env("DESKTOP_MCP_MODEL_TIMEOUT_SEC", 16.0, 5.0, 90.0)
 MODEL_RETRIES = _read_int_env("DESKTOP_MCP_MODEL_RETRIES", 1, 0, 6)
 MODEL_MAX_IMAGE_SIDE = _read_int_env("DESKTOP_MCP_IMAGE_MAX_SIDE", 1400, 640, 2560)
@@ -59,14 +119,31 @@ GOAL_DEADLINE_SEC = _read_float_env("DESKTOP_MCP_GOAL_DEADLINE_SEC", 105.0, 20.0
 
 
 def load_client() -> dict[str, str]:
-    api_key = _read_user_env("OI_THIRD_PARTY_API_KEY")
-    api_base = _read_user_env("OI_THIRD_PARTY_API_BASE")
-    model = _read_user_env("OI_THIRD_PARTY_MODEL") or "gpt-5.3-codex"
+    codex_cfg = _read_codex_provider_defaults()
+    api_key = _first_non_empty(
+        _read_user_env("OI_THIRD_PARTY_API_KEY"),
+        _read_user_env("OPENAI_API_KEY"),
+        _read_codex_auth_key(),
+        "EMPTY",
+    )
+    api_base = _first_non_empty(
+        _read_user_env("OI_THIRD_PARTY_API_BASE"),
+        _read_user_env("OPENAI_BASE_URL"),
+        _read_user_env("OPENAI_API_BASE"),
+        codex_cfg.get("api_base", ""),
+    )
+    model = _first_non_empty(
+        _read_user_env("OI_THIRD_PARTY_MODEL"),
+        _read_user_env("OPENAI_MODEL"),
+        codex_cfg.get("model", ""),
+        "gpt-5.3-codex",
+    )
     if "/" not in model:
         model = f"openai/{model}"
-    if not api_key or not api_base:
+    if not api_base:
         raise RuntimeError(
-            "Missing third-party config. Set OI_THIRD_PARTY_API_BASE / OI_THIRD_PARTY_API_KEY / OI_THIRD_PARTY_MODEL"
+            "Missing API base URL. Set OI_THIRD_PARTY_API_BASE or OPENAI_BASE_URL/OPENAI_API_BASE, "
+            "or provide ~/.codex/config.toml with model provider base_url."
         )
     return {"api_key": api_key, "api_base": api_base, "model": model}
 
