@@ -5,5 +5,13 @@
     "C:/path/to/desktop-mcp/desktop_mcp.py",
     "mcp-serve"
   ],
-  "env": {}
+  "env": {
+    "OI_THIRD_PARTY_API_BASE": "https://your-primary-gateway/v1",
+    "OI_THIRD_PARTY_API_KEY": "sk-your-primary-key",
+    "OI_THIRD_PARTY_MODEL": "gpt-5.3-codex",
+    "DESKTOP_MCP_CC_SWITCH_ENABLED": "true",
+    "DESKTOP_MCP_CC_SWITCH_BASE_URL": "http://127.0.0.1:15721/v1",
+    "DESKTOP_MCP_CC_SWITCH_API_KEY": "sk-local-test",
+    "DESKTOP_MCP_CC_SWITCH_MODEL": "gpt-5.3-codex"
+  }
 }
