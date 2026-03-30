@@ -1,8 +1,10 @@
 ﻿import argparse
 import base64
+import ctypes
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -11,8 +13,6 @@ from datetime import datetime
 import winreg
 from io import BytesIO
 from typing import Any, Optional
-
-import pyautogui
 
 try:
     from litellm import completion
@@ -23,6 +23,51 @@ try:
     from rapidocr_onnxruntime import RapidOCR
 except Exception:
     RapidOCR = None
+
+
+class _WinPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def _enable_windows_dpi_awareness() -> None:
+    if os.name != "nt":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _win_screen_metrics() -> Optional[tuple[int, int]]:
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        return int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1))
+    except Exception:
+        return None
+
+
+def _win_cursor_pos() -> Optional[tuple[int, int]]:
+    if os.name != "nt":
+        return None
+    try:
+        pt = _WinPoint()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return int(pt.x), int(pt.y)
+    except Exception:
+        return None
+    return None
+
+
+_enable_windows_dpi_awareness()
+
+import pyautogui
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.06
@@ -74,6 +119,47 @@ def _to_bool(v: Any, d: bool) -> bool:
     if s in {"0", "false", "no", "n", "off"}:
         return False
     return d
+
+
+def _get_clipboard_text() -> Optional[str]:
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if r.returncode != 0:
+            return None
+        return r.stdout
+    except Exception:
+        return None
+
+
+def _set_clipboard_text(text: str) -> bool:
+    try:
+        subprocess.run(
+            ["cmd", "/c", "clip"],
+            input=str(text),
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _paste_text(text: str, restore_clipboard: bool = True) -> bool:
+    previous = _get_clipboard_text() if restore_clipboard else None
+    if not _set_clipboard_text(text):
+        return False
+    pyautogui.hotkey("ctrl", "v")
+    time.sleep(0.08)
+    if restore_clipboard and previous is not None:
+        _set_clipboard_text(previous)
+    return True
 
 
 def _normalize_model(model: str, provider: str = "openai") -> str:
@@ -190,6 +276,9 @@ def _is_retryable_gateway_error(err: Exception) -> bool:
 
 
 def _screen() -> tuple[int, int]:
+    metrics = _win_screen_metrics()
+    if metrics:
+        return metrics
     s = pyautogui.size()
     return int(s.width), int(s.height)
 
@@ -392,6 +481,35 @@ def _ocr_digest(entries: list[dict[str, Any]], item_limit: int = 160, line_limit
         "ocr_items": entries[:item_limit],
         "ocr_text": "\n".join(lines),
     }
+
+
+def _local_ocr_payload(saved_path: str, reason: str, ok: bool) -> dict[str, Any]:
+    try:
+        digest = _ocr_digest(_ocr_entries(saved_path))
+        out = {
+            "summary": digest["summary"],
+            "focus_window": digest["focus_window"],
+            "key_text": digest["key_text"],
+            "ok": ok,
+            "reason": reason,
+            "saved_path": saved_path,
+            "ocr_items": digest["ocr_items"],
+            "ocr_text": digest["ocr_text"],
+        }
+    except Exception as e:
+        suffix = f"; {e}" if reason else str(e)
+        out = {
+            "summary": "local_ocr_failed",
+            "focus_window": "",
+            "key_text": [],
+            "ok": False,
+            "reason": (reason + suffix).strip("; "),
+            "saved_path": saved_path,
+            "ocr_items": [],
+            "ocr_text": "",
+        }
+    out["screenshot"] = saved_path
+    return out
 
 
 def _goal_keywords(goal: str) -> list[str]:
@@ -654,30 +772,7 @@ def observe(
         return _observe_result(out, raw_png, w, h, include_base64)
     if local_ocr:
         saved_path = _write_file(path, raw_png)
-        try:
-            digest = _ocr_digest(_ocr_entries(saved_path))
-            out = {
-                "summary": digest["summary"],
-                "focus_window": digest["focus_window"],
-                "key_text": digest["key_text"],
-                "ok": True,
-                "reason": "local_ocr",
-                "saved_path": saved_path,
-                "ocr_items": digest["ocr_items"],
-                "ocr_text": digest["ocr_text"],
-            }
-        except Exception as e:
-            out = {
-                "summary": "local_ocr_failed",
-                "focus_window": "",
-                "key_text": [],
-                "ok": False,
-                "reason": str(e),
-                "saved_path": saved_path,
-                "ocr_items": [],
-                "ocr_text": "",
-            }
-        out["screenshot"] = saved_path
+        out = _local_ocr_payload(saved_path, reason="local_ocr", ok=True)
         if delete_after_read and not save:
             out["deleted_after_read"] = _safe_remove(saved_path)
             out["deleted_path"] = saved_path
@@ -692,14 +787,11 @@ def observe(
         client = _client()
         out = _call_json(client, sys_prompt, user, b64=_model_b64(img))
     except Exception as e:
-        out = {
-            "summary": "model_observe_unavailable",
-            "focus_window": "",
-            "key_text": [],
-            "ok": False,
-            "reason": str(e),
-        }
-        out["saved_path"] = _write_file(path, raw_png)
+        saved_path = _write_file(path, raw_png)
+        fallback_reason = f"local_ocr_fallback_after_model_error: {e}"
+        out = _local_ocr_payload(saved_path, reason=fallback_reason, ok=not bool(condition.strip()))
+        out["model_error"] = str(e)
+        out["fallback"] = "local_ocr"
     if isinstance(out, dict) and out.get("_client_source"):
         out["model_source"] = out.get("_client_source")
     if save:
@@ -811,6 +903,9 @@ SHORTCUTS = {
 
 
 def _mouse() -> dict[str, int]:
+    pos = _win_cursor_pos()
+    if pos:
+        return {"x": pos[0], "y": pos[1]}
     p = pyautogui.position()
     return {"x": int(p.x), "y": int(p.y)}
 
@@ -910,6 +1005,22 @@ def act(a: dict[str, Any]) -> dict[str, Any]:
         pyautogui.write(txt, interval=max(0.0, min(0.5, _to_float(a.get("interval"), 0.01))))
         return {"ok": True, "action": "type", "result": f"type({len(txt)} chars)", "mouse": _mouse()}
 
+    if t == "paste":
+        txt = str(a.get("text", ""))
+        if not txt:
+            raise ValueError("paste requires text")
+        restore = _to_bool(a.get("restore_clipboard"), True)
+        if not _paste_text(txt, restore_clipboard=restore):
+            raise RuntimeError("paste failed")
+        return {"ok": True, "action": "paste", "result": f"paste({len(txt)} chars)", "mouse": _mouse()}
+
+    if t == "clear_text":
+        pyautogui.hotkey("ctrl", "a")
+        time.sleep(max(0.02, min(0.3, _to_float(a.get("select_wait"), 0.06))))
+        key = "delete" if _to_bool(a.get("use_delete"), False) else "backspace"
+        pyautogui.press(key, presses=max(1, min(20, _to_int(a.get("presses"), 1))), interval=0.03)
+        return {"ok": True, "action": "clear_text", "result": f"clear_text({key})", "mouse": _mouse()}
+
     if t in {"press", "key_press"}:
         k = _key(a.get("key"))
         n = max(1, min(300, _to_int(a.get("presses"), 1)))
@@ -1002,12 +1113,14 @@ def goal_run(
                     return {"ok": False, "error": "handoff_required", "handoff": handoff, "logs": logs}
             sys_prompt = (
                 "Return strict JSON only: "
-                '{"done":true/false,"handoff":true/false,"reason":"...","question":"...","action":{"type":"move|click|double_click|right_click|type|hotkey|press|scroll|wait|screenshot","x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8},"verify":"..."}. '
+                '{"done":true/false,"handoff":true/false,"reason":"...","question":"...","action":{"type":"move|click|double_click|right_click|type|paste|clear_text|hotkey|press|scroll|wait|screenshot","x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8},"verify":"..."}. '
                 "You are operating a Windows desktop from OCR text boxes only. Each OCR line has visible text and coordinates. "
                 "If OCR is insufficient or the next decision depends on non-textual visual structure, set handoff=true and explain what must be inspected in the screenshot. "
                 "Prefer keyboard shortcuts when they are more reliable than coordinate guesses. "
                 "If you need to type into an existing field, first focus that field with a click unless the history clearly shows it is already focused. "
                 "When OCR merges a field label and its current value into one line, you may click that line's center to focus the field. "
+                "Use clear_text before entering replacement text when a field may already contain content. "
+                "Prefer paste over type for short commands, URLs, or other text where exact characters matter. "
                 "For dialog submission after typing, prefer clicking a visible confirm button such as OK/Open/Run/Confirm instead of relying on Enter if focus is uncertain. "
                 "If clicking text, use the provided OCR center coordinates. One action per step."
             )
@@ -1024,7 +1137,7 @@ def goal_run(
             img, _, w, h = _capture_screen()
             sys_prompt = (
                 "Return strict JSON only: "
-                '{"done":true/false,"reason":"...","action":{"type":"move|click|double_click|right_click|type|hotkey|press|scroll|wait|screenshot","x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8},"verify":"..."}. '
+                '{"done":true/false,"reason":"...","action":{"type":"move|click|double_click|right_click|type|paste|clear_text|hotkey|press|scroll|wait|screenshot","x":0,"y":0,"text":"","keys":[],"key":"","amount":0,"seconds":0.8},"verify":"..."}. '
                 "One action per step. Use in-screen coordinates only."
             )
             user = f"Goal: {goal}\nScreen: {w}x{h}\nHistory:\n" + ("\n".join(hist[-12:]) if hist else "(empty)")
@@ -1348,7 +1461,7 @@ def parser() -> argparse.ArgumentParser:
     cl.set_defaults(func=cmd_cleanup)
 
     a = sub.add_parser("action")
-    a.add_argument("action_name", choices=["position", "screenshot", "move", "move_to", "move_rel", "move_relative", "click", "double_click", "right_click", "middle_click", "mouse_down", "mouse_up", "drag_to", "drag", "drag_rel", "drag_relative", "scroll", "wheel", "hscroll", "scroll_horizontal", "type", "press", "key_press", "delete", "backspace", "key_down", "key_up", "hotkey", "shortcut", "wait"])
+    a.add_argument("action_name", choices=["position", "screenshot", "move", "move_to", "move_rel", "move_relative", "click", "double_click", "right_click", "middle_click", "mouse_down", "mouse_up", "drag_to", "drag", "drag_rel", "drag_relative", "scroll", "wheel", "hscroll", "scroll_horizontal", "type", "paste", "clear_text", "press", "key_press", "delete", "backspace", "key_down", "key_up", "hotkey", "shortcut", "wait"])
     a.add_argument("--x", type=int)
     a.add_argument("--y", type=int)
     a.add_argument("--dx", type=int)
